@@ -18,6 +18,9 @@
 #include <stdarg.h>
 #include <stdio.h>
 
+#include "encoding.h"
+
+
 void __attribute__((noreturn)) bad_trap(uintptr_t* regs, uintptr_t dummy, uintptr_t mepc)
 {
   die("machine mode: unhandlable trap %d @ %p", read_csr(mcause), mepc);
@@ -184,17 +187,45 @@ send_ipi:
 
 void redirect_trap(uintptr_t epc, uintptr_t mstatus, uintptr_t badaddr)
 {
-  write_csr(sbadaddr, badaddr);
-  write_csr(sepc, epc);
-  write_csr(scause, read_csr(mcause));
-  write_csr(mepc, read_csr(stvec));
+  //check if the cause is delegated to user
+  uintptr_t cause = read_csr(mcause);
 
-  uintptr_t new_mstatus = mstatus & ~(MSTATUS_SPP | MSTATUS_SPIE | MSTATUS_SIE);
-  uintptr_t mpp_s = MSTATUS_MPP & (MSTATUS_MPP >> 1);
-  new_mstatus |= (mstatus * (MSTATUS_SPIE / MSTATUS_SIE)) & MSTATUS_SPIE;
-  new_mstatus |= (mstatus / (mpp_s / MSTATUS_SPP)) & MSTATUS_SPP;
-  new_mstatus |= mpp_s;
-  write_csr(mstatus, new_mstatus);
+  if(1 && cause == CAUSE_MPKEY_MISMATCH_FAULT && read_csr(sedeleg) & (1 << cause)){
+    //die("Unhandled trap within M-mode that should normally be delegated to the user");
+    write_csr(utval, badaddr);
+    write_csr(uepc, epc);
+    write_csr(ucause, cause);
+
+    uintptr_t pc_offset = (read_csr(utvec) & 1) ? 4*cause : 0;
+    uintptr_t pc = (read_csr(utvec) & ~(uintptr_t)1) + pc_offset;
+    write_csr(mepc, pc);
+
+    printm("M: redirect_trap to user\n");
+    uintptr_t new_mstatus = mstatus & ~(MSTATUS_SPP | MSTATUS_UPIE | MSTATUS_UIE);
+    uintptr_t mpp_s = MSTATUS_MPP & (MSTATUS_MPP >> 1); //remove highest bit from mask?
+    new_mstatus |= (mstatus * (MSTATUS_UPIE / MSTATUS_UIE)) & MSTATUS_UPIE;
+    new_mstatus |= (mstatus / (mpp_s / MSTATUS_SPP)) & MSTATUS_SPP; //suspekt
+    //new_mstatus |= mpp_s;
+    write_csr(mstatus, new_mstatus);
+
+    //set umpk.mode bit to 1
+    uint64_t mpk = read_csr2(CSR_UMPK);
+    mpk = mpk | ((uint64_t)1 << 63);
+    write_csr2(CSR_UMPK, mpk);
+
+  }else{
+    write_csr(sbadaddr, badaddr);
+    write_csr(sepc, epc);
+    write_csr(scause, read_csr(mcause));
+    write_csr(mepc, read_csr(stvec));
+
+    uintptr_t new_mstatus = mstatus & ~(MSTATUS_SPP | MSTATUS_SPIE | MSTATUS_SIE);
+    uintptr_t mpp_s = MSTATUS_MPP & (MSTATUS_MPP >> 1);
+    new_mstatus |= (mstatus * (MSTATUS_SPIE / MSTATUS_SIE)) & MSTATUS_SPIE;
+    new_mstatus |= (mstatus / (mpp_s / MSTATUS_SPP)) & MSTATUS_SPP;
+    new_mstatus |= mpp_s;
+    write_csr(mstatus, new_mstatus);
+  }
 
   extern void __redirect_trap();
   return __redirect_trap();
@@ -226,6 +257,7 @@ void trap_from_machine_mode(uintptr_t* regs, uintptr_t dummy, uintptr_t mepc)
     case CAUSE_FETCH_ACCESS:
     case CAUSE_LOAD_ACCESS:
     case CAUSE_STORE_ACCESS:
+    case CAUSE_MPKEY_MISMATCH_FAULT:
       return machine_page_fault(regs, dummy, mepc);
     default:
       bad_trap(regs, dummy, mepc);

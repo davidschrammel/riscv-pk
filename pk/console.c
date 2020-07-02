@@ -3,6 +3,7 @@
 #include "pk.h"
 #include "file.h"
 #include "frontend.h"
+#include "mmap.h"
 #include <stdint.h>
 #include <stdarg.h>
 
@@ -41,6 +42,7 @@ void dump_tf(trapframe_t* tf)
   }
   printk("pc %lx va %lx insn       %x sr %lx\n", tf->epc, tf->badvaddr,
          (uint32_t)tf->insn, tf->status);
+  debug_pte(tf->badvaddr);
 }
 
 void do_panic(const char* s, ...)

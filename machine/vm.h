@@ -24,7 +24,7 @@ static inline void flush_tlb()
   asm volatile ("sfence.vma");
 }
 
-static inline pte_t pte_create(uintptr_t ppn, int type)
+static inline pte_t pte_create(uintptr_t ppn, uintptr_t type)
 {
   return (ppn << PTE_PPN_SHIFT) | PTE_V | type;
 }

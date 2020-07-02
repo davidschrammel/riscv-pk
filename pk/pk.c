@@ -138,6 +138,19 @@ static void run_loaded_program(size_t argc, char** argv, uintptr_t kstack_top)
   init_tf(&tf, current.entry, stack_top);
   __clear_cache(0, 0);
   write_csr(sscratch, kstack_top);
+
+  //initialize mpk reg
+  #define CSR_MPK 0x046
+  #define CSR_SEDELEG 0x102
+  #define CAUSE_MPKEY_MISMATCH_FAULT 0xe //TODO
+
+  unsigned long long mpk = (uint64_t)0x1ULL << 63;
+  asm volatile ("csrw %0, %1" : : "i"(CSR_MPK), "r"(mpk) );
+
+  unsigned long long sedeleg = (1U << CAUSE_MPKEY_MISMATCH_FAULT);
+  sedeleg |= (1U << CAUSE_USER_ECALL);
+  asm volatile ("csrw %0, %1" : : "i"(CSR_SEDELEG), "r"(sedeleg) );
+
   start_user(&tf);
 }
 

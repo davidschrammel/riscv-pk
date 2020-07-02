@@ -198,6 +198,27 @@
 #define write_csr(reg, val) ({ \
   asm volatile ("csrw " #reg ", %0" :: "rK"(val)); })
 
+
+
+#define CSR_UMPK 0x46
+
+#define read_csr2(csr)						\
+({								\
+	register unsigned long __v;				\
+	__asm__ __volatile__ ("csrr %0, %1"		\
+			      : "=r" (__v) : "i"(csr)	\
+			      : "memory");			\
+	__v;							\
+})
+#define write_csr2(csr, val)					\
+({								\
+	unsigned long __v = (unsigned long)(val);		\
+	__asm__ __volatile__ ("csrw %0, %1"		\
+			      : : "i"(csr), "rK" (__v)			\
+			      : "memory");			\
+})
+
+
 #define swap_csr(reg, val) ({ unsigned long __tmp; \
   asm volatile ("csrrw %0, " #reg ", %1" : "=r"(__tmp) : "rK"(val)); \
   __tmp; })
@@ -973,6 +994,7 @@
 #define CAUSE_MACHINE_ECALL 0xb
 #define CAUSE_FETCH_PAGE_FAULT 0xc
 #define CAUSE_LOAD_PAGE_FAULT 0xd
+#define CAUSE_MPKEY_MISMATCH_FAULT 0xe
 #define CAUSE_STORE_PAGE_FAULT 0xf
 #endif
 #ifdef DECLARE_INSN

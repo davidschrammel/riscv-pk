@@ -20,6 +20,7 @@ typedef struct {
   size_t brk_max;
   size_t mmap_max;
   size_t stack_top;
+  size_t stack_bottom;
   size_t time0;
   size_t cycle0;
   size_t instret0;

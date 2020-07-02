@@ -340,7 +340,35 @@ uintptr_t sys_mremap(uintptr_t addr, size_t old_size, size_t new_size, int flags
 
 uintptr_t sys_mprotect(uintptr_t addr, size_t length, int prot)
 {
-  return do_mprotect(addr, length, prot);
+  return do_mprotect(addr, length, prot, -1);
+}
+
+uintptr_t sys_pkey_mprotect(uintptr_t addr, size_t length, int prot, int pkey)
+{
+  return do_mprotect(addr, length, prot, pkey);
+}
+
+#define MAX_PKEYS  1023 // 1 higher than the highest actual pkey. note: value 1023 is reserved on riscv (for backward compatibility)
+unsigned char sys_pkey_alloced[MAX_PKEYS] = {1, 0,};
+
+int sys_pkey_alloc(unsigned long flags, unsigned long init_access_rights)
+{
+  for (size_t i = 0; i < MAX_PKEYS; i++) {
+    if (!sys_pkey_alloced[i]) {
+      sys_pkey_alloced[i] = 1;
+      return i;
+    }
+  }
+  return -1;
+}
+
+int sys_pkey_free(int pkey)
+{
+  if (pkey < 0 || pkey >= MAX_PKEYS) {
+    return -1;
+  }
+  sys_pkey_alloced[pkey] = 0;
+  return 0;
 }
 
 int sys_rt_sigaction(int sig, const void* act, void* oact, size_t sssz)
@@ -413,6 +441,13 @@ static int sys_stub_nosys()
   return -ENOSYS;
 }
 
+long sys_get_stack(long * stack_addr, long * stack_size)
+{
+  *stack_addr = current.stack_bottom;
+  *stack_size = current.stack_top - current.stack_bottom;
+  return 0;
+}
+
 long do_syscall(long a0, long a1, long a2, long a3, long a4, long a5, unsigned long n)
 {
   const static void* syscall_table[] = {
@@ -442,6 +477,9 @@ long do_syscall(long a0, long a1, long a2, long a3, long a4, long a5, unsigned l
     [SYS_munmap] = sys_munmap,
     [SYS_mremap] = sys_mremap,
     [SYS_mprotect] = sys_mprotect,
+    [SYS_pkey_mprotect] = sys_pkey_mprotect,
+    [SYS_pkey_free] = sys_pkey_free,
+    [SYS_pkey_alloc] = sys_pkey_alloc,
     [SYS_prlimit64] = sys_stub_nosys,
     [SYS_rt_sigaction] = sys_rt_sigaction,
     [SYS_gettimeofday] = sys_gettimeofday,
@@ -462,6 +500,8 @@ long do_syscall(long a0, long a1, long a2, long a3, long a4, long a5, unsigned l
     [SYS_chdir] = sys_chdir,
     [SYS_set_tid_address] = sys_stub_nosys,
     [SYS_set_robust_list] = sys_stub_nosys,
+
+    [SYS_stack] = sys_get_stack,
   };
 
   const static void* old_syscall_table[] = {

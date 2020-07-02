@@ -82,7 +82,7 @@ void load_elf(const char* fn, elf_info* info)
         goto fail;
       memset((void*)vaddr - prepad, 0, prepad);
       if (!(prot & PROT_WRITE))
-        if (do_mprotect(vaddr - prepad, ph[i].p_filesz + prepad, prot))
+        if (do_mprotect(vaddr - prepad, ph[i].p_filesz + prepad, prot, -1))
           goto fail;
       size_t mapped = ROUNDUP(ph[i].p_filesz + prepad, RISCV_PGSIZE) - prepad;
       if (ph[i].p_memsz > mapped)

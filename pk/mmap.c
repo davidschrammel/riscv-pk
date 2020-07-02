@@ -7,17 +7,38 @@
 #include "bits.h"
 #include "mtrap.h"
 #include <stdint.h>
+#include <limits.h>
 #include <errno.h>
 
+// Enable
+//#define DEBUG if(1) 
+// Disable
+#define DEBUG if(0)
+
+// Ensure that sizeof(vmr_t) % 2 == 0
+// This ensures that when storing a vmr_t pointer into *pte, it does not
+// accidentally set the PTE_V bit.
 typedef struct {
   uintptr_t addr;
   size_t length;
   file_t* file;
   size_t offset;
   unsigned refcnt;
-  int prot;
+  uintptr_t prot;
 } vmr_t;
 
+void debug_vmr_t(vmr_t* v) {
+  printm("vmr_t {\n");
+  printm("  addr = 0x%lx\n", (uintptr_t)v->addr);
+  printm("  len  = 0x%lx\n", (uintptr_t)v->length);
+  printm("  file = 0x%lx\n", (uintptr_t)v->file);
+  printm("  off  = 0x%lx\n", (uintptr_t)v->offset);
+  printm("  refc = 0x%lx\n", v->refcnt);
+  printm("  prot = 0x%lx\n", (uintptr_t)v->prot);
+  printm("}\n");
+}
+
+#define PK_MASK (((uintptr_t)0x03FF) << 54)
 #define MAX_VMR (RISCV_PGSIZE / sizeof(vmr_t))
 static spinlock_t vm_lock = SPINLOCK_INIT;
 static vmr_t* vmrs;
@@ -52,6 +73,8 @@ static vmr_t* __vmr_alloc(uintptr_t addr, size_t length, file_t* file,
   mb();
 
   for (vmr_t* v = vmrs; v < vmrs + MAX_VMR; v++) {
+    kassert(((uintptr_t)v % 2) == 0);
+    kassert(v->refcnt >= 0);
     if (v->refcnt == 0) {
       if (file)
         file_incref(file);
@@ -67,18 +90,35 @@ static vmr_t* __vmr_alloc(uintptr_t addr, size_t length, file_t* file,
   return NULL;
 }
 
+static void __vmr_incref(vmr_t* v, unsigned inc)
+{
+  if(v->refcnt >= UINT_MAX - inc) {
+    printm("Error in __vmr_incref(inc=%d)\n", inc),
+    debug_vmr_t(v);
+    kassert(0);
+  }
+  v->refcnt += inc;
+}
+
 static void __vmr_decref(vmr_t* v, unsigned dec)
 {
+  if(v->refcnt < dec) {
+    printm("Error in __vmr_decref\n"),
+    debug_vmr_t(v);
+    kassert(0);
+  }
   if ((v->refcnt -= dec) == 0)
   {
     if (v->file)
       file_decref(v->file);
+    // to ensure it is not accidentally used
+    memset(v, 0, sizeof(*v));
   }
 }
 
 static size_t pte_ppn(pte_t pte)
 {
-  return pte >> PTE_PPN_SHIFT;
+  return ((pte & ~PK_MASK) >> PTE_PPN_SHIFT);
 }
 
 static uintptr_t ppn(uintptr_t addr)
@@ -128,6 +168,26 @@ static int __va_avail(uintptr_t vaddr)
   return pte == 0 || *pte == 0;
 }
 
+void debug_pte(uintptr_t addr)
+{
+  pte_t* pte = __walk(addr);
+  if (!pte) {
+    printm("PTE not present\n");
+    return;
+  }
+  if (!*pte) {
+    printm("*pte zero\n");
+    return;
+  }
+  if (*pte & PTE_V) {
+    printm("PTE = 0x%lx\n", *pte);
+  } else {
+    printm("PTE is unmapped and points to vmr_t\n");
+    vmr_t* v = (vmr_t*)*pte;
+    debug_vmr_t(v);
+  }
+}
+
 static uintptr_t __vm_alloc(size_t npage)
 {
   uintptr_t start = current.brk, end = current.mmap_max - npage*RISCV_PGSIZE;
@@ -145,7 +205,11 @@ static uintptr_t __vm_alloc(size_t npage)
   return 0;
 }
 
-static inline pte_t prot_to_type(int prot, int user)
+static inline pte_t prot_without_pkey(uintptr_t prot){
+  return prot & ~PK_MASK;
+}
+
+static inline pte_t prot_to_type(uintptr_t prot, int user)
 {
   pte_t pte = 0;
   if (prot & PROT_READ) pte |= PTE_R | PTE_A;
@@ -153,6 +217,10 @@ static inline pte_t prot_to_type(int prot, int user)
   if (prot & PROT_EXEC) pte |= PTE_X | PTE_A;
   if (pte == 0) pte = PTE_R;
   if (user) pte |= PTE_U;
+
+  // copy pkey
+  pte |= prot & PK_MASK;
+
   return pte;
 }
 
@@ -175,9 +243,11 @@ static int __handle_page_fault(uintptr_t vaddr, int prot)
   else if (!(*pte & PTE_V))
   {
     uintptr_t ppn = vpn + (first_free_paddr / RISCV_PGSIZE);
-
+    // Since *pte is invalid, it is a pointer to vmr_t*
     vmr_t* v = (vmr_t*)*pte;
+    // temporarily map page with read & write permissions for writing file contents
     *pte = pte_create(ppn, prot_to_type(PROT_READ|PROT_WRITE, 0));
+    kassert((*pte & PK_MASK) == 0);
     flush_tlb();
     if (v->file)
     {
@@ -187,10 +257,16 @@ static int __handle_page_fault(uintptr_t vaddr, int prot)
       if (ret < RISCV_PGSIZE)
         memset((void*)vaddr + ret, 0, RISCV_PGSIZE - ret);
     }
-    else
+    else {
       memset((void*)vaddr, 0, RISCV_PGSIZE);
-    __vmr_decref(v, 1);
+    }
+    // map page with correct permissions
     *pte = pte_create(ppn, prot_to_type(v->prot, 1));
+    DEBUG printm("__handle_page_fault: v->prot: 0x%lx\n", v->prot);
+    DEBUG printm("__handle_page_fault: new pte is: 0x%lx\n", *pte);
+    DEBUG debug_vmr_t(v);
+    kassert(*pte & PTE_V);
+    __vmr_decref(v, 1);
   }
 
   pte_t perms = pte_create(0, prot_to_type(prot, 1));
@@ -227,6 +303,7 @@ static void __do_munmap(uintptr_t addr, size_t len)
 
 uintptr_t __do_mmap(uintptr_t addr, size_t length, int prot, int flags, file_t* f, off_t offset)
 {
+  DEBUG printm("PK __do_mmap(addr=%p, len=0x%x, prot=0x%x, flags=0x%x, f=%p, offset=0x%x)\n", (void*)addr, length, prot, flags, f, offset);
   size_t npage = (length-1)/RISCV_PGSIZE+1;
   if (flags & MAP_FIXED)
   {
@@ -272,6 +349,7 @@ int do_munmap(uintptr_t addr, size_t length)
 
 uintptr_t do_mmap(uintptr_t addr, size_t length, int prot, int flags, int fd, off_t offset)
 {
+  DEBUG printm("PK do_mmap(addr=%p, len=0x%x, prot=0x%x, flags=0x%x, fd=%d, offset=0x%x)\n", (void*)addr, length, prot, flags, fd, offset);
   if (!(flags & MAP_PRIVATE) || length == 0 || (offset & (RISCV_PGSIZE-1)))
     return -EINVAL;
 
@@ -325,13 +403,23 @@ uintptr_t do_mremap(uintptr_t addr, size_t old_size, size_t new_size, int flags)
   return -ENOSYS;
 }
 
-uintptr_t do_mprotect(uintptr_t addr, size_t length, int prot)
+uintptr_t do_mprotect(uintptr_t addr, size_t length, uintptr_t prot, int pkey)
 {
+  DEBUG printm("PK: do_mprotect(%lx, %d, %d, %d)\n",addr, length, prot, pkey);
+
+  if(pkey != -1){
+    prot |= (uintptr_t)(pkey & 0x03FF) << 54;
+    DEBUG printm("prot = 0x%lx\n", prot);
+  }
+
   uintptr_t res = 0;
   if ((addr) & (RISCV_PGSIZE-1))
     return -EINVAL;
 
   spinlock_lock(&vm_lock);
+
+  vmr_t* orig_v = NULL;
+  vmr_t* new_v = NULL;
     for (uintptr_t a = addr; a < addr + length; a += RISCV_PGSIZE)
     {
       pte_t* pte = __walk(a);
@@ -339,21 +427,59 @@ uintptr_t do_mprotect(uintptr_t addr, size_t length, int prot)
         res = -ENOMEM;
         break;
       }
-  
+      DEBUG printm("PK walk %p to pte %p deref %p\n", (void*)a, pte, *pte);
       if (!(*pte & PTE_V)) {
+        // PTE is invalid (bit 0 is zero). Therefore, it is a pointer to vmr_t
         vmr_t* v = (vmr_t*)*pte;
-        if((v->prot ^ prot) & ~v->prot){
+        // If protection is elevated 
+        if((prot_without_pkey(v->prot) ^ prot_without_pkey(prot)) & ~prot_without_pkey(v->prot)){
+        //if((v->prot ^ prot) & ~v->prot){
           //TODO:look at file to find perms
+          printm("PK do_mprotect: EACCES TODO\n");
           res = -EACCES;
           break;
         }
+
+        if (v->refcnt > 1) {
+          // Create a separate vmr struct for the mprotected pages
+          // If multiple pages with the same vmr struct (orig_v) are mprotected, 
+          // reuse the newly created vmr struct (new_v)
+          if (!new_v || orig_v != v) {
+            orig_v = v;
+            new_v = __vmr_alloc(v->addr, v->length, v->file, v->offset, 1, v->prot); // v->prot is updated below
+            DEBUG printm("PK do_mprotect: allocating new vmr\n");
+            if (!new_v) {
+              printm("PK do_mprotect: __vmr_alloc failed!\n");
+              res = -EACCES;
+              break;
+            }
+          } else {
+            __vmr_incref(new_v, 1); // increment new vmr
+          }
+          __vmr_decref(v, 1); // decrement old vmr
+
+          //~ printm("current vmr\n");
+          //~ debug_vmr_t(v);
+          //~ printm("new vmr\n");
+          //~ debug_vmr_t(new_v);
+          //~ printm("orig vmr\n");
+          //~ debug_vmr_t(orig_v);
+          v = new_v;
+          *pte = (pte_t) v;
+          DEBUG printm("PK do_mprotect: setting pte=%p deref %p\n", pte, *pte);
+        }
+        DEBUG printm("PK do_mprotect: updating page %p permissions from %x to %x\n", (void*)a, v->prot, prot);
         v->prot = prot;
       } else {
-        if (!(*pte & PTE_U) ||
-            ((prot & PROT_READ) && !(*pte & PTE_R)) ||
+        // PTE is valid (bit 0 is one). Therefore, it is an actual PTE
+        if (!(*pte & PTE_U) || // Deny mprotect on kernel pages
+            ((prot & PROT_READ ) && !(*pte & PTE_R)) || // If protection is being elevated
             ((prot & PROT_WRITE) && !(*pte & PTE_W)) ||
-            ((prot & PROT_EXEC) && !(*pte & PTE_X))) {
+            ((prot & PROT_EXEC ) && !(*pte & PTE_X))) {
           //TODO:look at file to find perms
+          // Problem: since we decref'd vmr_t, we don't have access to 
+          // original file pointer anymore, if present.
+          DEBUG printm("PK do_mprotect: TODO2");
           res = -EACCES;
           break;
         }
@@ -411,6 +537,8 @@ uintptr_t pk_vm_init()
   size_t stack_bottom = __do_mmap(current.mmap_max - stack_size, stack_size, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, 0, 0);
   kassert(stack_bottom != (uintptr_t)-1);
   current.stack_top = stack_bottom + stack_size;
+  current.stack_bottom = stack_bottom;
+  //printm("PK stack = %p -- %p\n", stack_bottom, current.stack_top);
 
   flush_tlb();
   write_csr(sptbr, ((uintptr_t)root_page_table >> RISCV_PGSHIFT) | SATP_MODE_CHOICE);
